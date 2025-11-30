@@ -1,0 +1,170 @@
+import time
+import board
+import digitalio
+import pwmio
+import adafruit_msa311
+
+# ================================
+# KONFIGURATION
+# ================================
+
+# PIN-KOPPLING
+btn1 = digitalio.DigitalInOut(board.D10)
+btn2 = digitalio.DigitalInOut(board.D11)
+btn3 = digitalio.DigitalInOut(board.D12)
+for b in (btn1, btn2, btn3):
+    b.switch_to_input(pull=digitalio.Pull.DOWN)
+
+led_green = digitalio.DigitalInOut(board.A0)
+led_green.direction = digitalio.Direction.OUTPUT
+
+led_yellow = digitalio.DigitalInOut(board.A1)
+led_yellow.direction = digitalio.Direction.OUTPUT
+
+led_red = digitalio.DigitalInOut(board.A2)
+led_red.direction = digitalio.Direction.OUTPUT
+
+# Buzzer (PWM)
+buzzer = pwmio.PWMOut(board.D9, duty_cycle=0, frequency=440)
+
+# Accelerometer (MSA311 I2C)
+i2c = board.I2C()
+accel = adafruit_msa311.MSA311(i2c)
+
+# ================================
+# PARAMETERINSTÄLLNING
+# ================================
+TRIG_THRESHOLD = 15       # rörelsetröskel
+ARM_DELAY = 30            # tid att lämna rummet
+DISARM_TIMEOUT = 15       # tid att knappa in kod vid rörelse
+LED_TIMEOUT = 30          # energisparsläckning
+CODE = [1, 2, 3]          # vald kodsekvens
+
+# ================================
+# SYSTEMVARIABLER
+# ================================
+state = "safe"
+button_sequence = []
+last_led_time = time.monotonic()
+last_motion_read = accel.acceleration
+
+# ================================
+# FUNKTIONER
+# ================================
+def beep(on):
+    buzzer.duty_cycle = 30000 if on else 0
+
+def led(g=False, y=False, r=False):
+    global last_led_time
+    led_green.value = g
+    led_yellow.value = y
+    led_red.value = r
+    last_led_time = time.monotonic()
+
+def read_buttons():
+    if btn1.value: return 1
+    if btn2.value: return 2
+    if btn3.value: return 3
+    return None
+
+def motion_detected():
+    global last_motion_read
+    x, y, z = accel.acceleration
+    lx, ly, lz = last_motion_read
+    dx = abs(x - lx)
+    dy = abs(y - ly)
+    dz = abs(z - lz)
+    last_motion_read = (x, y, z)
+    return dx > TRIG_THRESHOLD or dy > TRIG_THRESHOLD or dz > TRIG_THRESHOLD
+
+def check_code_input():
+    global button_sequence
+    btn = read_buttons()
+    if btn:
+        button_sequence.append(btn)
+        time.sleep(0.2)  # debounce
+
+    if len(button_sequence) == len(CODE):
+        ok = button_sequence == CODE
+        button_sequence = []
+        return ok
+    return None
+
+# ================================
+# HUVUDLOOP – TILLSTÅNDSMASKIN
+# ================================
+led(g=True)
+
+while True:
+
+    # Energisparläge för LED
+    if time.monotonic() - last_led_time > LED_TIMEOUT:
+        led(False, False, False)
+
+    # ============================
+    # STATE: SAFE (INAKTIVT LÄGE)
+    # ============================
+    if state == "safe":
+        result = check_code_input()
+        if result:
+            led(y=True)
+            start = time.monotonic()
+            state = "arm_delay"
+        continue
+
+    # ============================
+    # STATE: ARM_DELAY (30 sek)
+    # ============================
+    if state == "arm_delay":
+        if check_code_input():  # användaren avbryter
+            led(g=True)
+            state = "safe"
+        elif time.monotonic() - start > ARM_DELAY:
+            led(y=False)  # släck gul LED – energispar
+            state = "armed"
+        continue
+
+    # ============================
+    # STATE: ARMED (VÄNTAR PÅ RÖRELSE)
+    # ============================
+    if state == "armed":
+        if check_code_input():  # avaktivera innan rörelse
+            led(g=True)
+            state = "safe"
+        elif motion_detected():
+            start = time.monotonic()
+            led(r=True)
+            state = "movement"
+        continue
+
+    # ============================
+    # STATE: MOVEMENT (15 sek)
+    # ============================
+    if state == "movement":
+        result = check_code_input()
+        if result:  # korrekt kod stoppar allt
+            beep(False)
+            led(g=True)
+            state = "safe"
+        else:
+            # varningspip (intermittent)
+            beep(int(time.monotonic() * 2) % 2)
+
+            if time.monotonic() - start > DISARM_TIMEOUT:
+                state = "alarm"
+                beep(True)
+        continue
+
+    # ============================
+    # STATE: ALARM (FULLT LARM)
+    # ============================
+    if state == "alarm":
+        # blinkande röd + pip
+        led(r=(int(time.monotonic() * 4) % 2))
+        beep(True)
+
+        if check_code_input():
+            beep(False)
+            led(g=True)
+            state = "safe"
+        continue
