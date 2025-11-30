@@ -98,5 +98,3 @@ code.py       - main program
 README.md     - documentation  
 lib/          - required libraries  
 
-## License
-MIT License (you may change this if needed)
